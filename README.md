@@ -28,3 +28,17 @@ npm run dev
 - 综合过程健康评分
 
 扩展接口：`/api/recipes`、`/api/control/commands`、`/api/maintenance/windows`、`/api/process/health-score`。
+
+## 异常—调查—工单闭环
+
+异常交接必须先调查、用证据验证假设，再决定派单；工单与异常通过假设建立关联，避免重复派单和未完工关闭异常。
+
+- `POST /api/investigations/:id/hypotheses/:hypothesisId/convert-work-order`：把调查假设转换为与异常关联的工单。同一假设重复转换为幂等操作，直接返回原工单（审计记 `work-order.convert-replay`）。
+- 工单状态机：`planned` → `processing` → `completed`。
+  - `POST /api/work-orders/:id/start`：开工；重复开工幂等；已完成工单再开工返回 409。
+  - `POST /api/work-orders/:id/complete`：完成**必须提交处置证据** `{"evidence":{"observation":"..."}}`，否则 400；重复完成返回 409。
+  - `GET /api/work-orders?status=&anomalyId=`：查询工单。
+- `POST /api/anomalies/:id/resolve`：存在关联工单时，必须全部 `completed` 且都带有处置证据，否则 409 并返回待处理工单清单（审计记 `anomaly.resolve-blocked`）；**无关联工单时保留旧行为**，提交 resolution evidence 即可关闭；重复关闭返回 409。
+- 保留旧行为：独立建工单 `POST /api/work-orders`（`source: 'manual'`，不挂异常）、调查追加证据 `POST /api/investigations/:id/evidence`、无工单凭证据关闭异常。
+- 不存在的异常/调查/假设/工单均返回 404。
+- 审计可还原完整链路：`work-order.convert-from-hypothesis`（含 anomalyId/investigationId/hypothesisId 关联）、`work-order.status-change`（from/to）、`anomaly.resolve-blocked`、`anomaly.resolve`。
