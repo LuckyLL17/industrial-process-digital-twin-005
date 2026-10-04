@@ -28,3 +28,16 @@ npm run dev
 - 综合过程健康评分
 
 扩展接口：`/api/recipes`、`/api/control/commands`、`/api/maintenance/windows`、`/api/process/health-score`。
+
+## 异常-调查-工单联动
+
+调查假设可转换为关联工单，避免异常、调查、工单彼此独立导致的重复派单或未修复先关闭：
+
+- `POST /api/investigations/:id/hypotheses/:hid/convert`：把假设转换为关联工单（携带 anomalyId/investigationId/hypothesisId）；重复转换幂等返回原工单（`deduplicated:true`），不重复派单。
+- 工单状态机：`planned → in_progress → completed`。
+  - `POST /api/work-orders/:id/start`：进入处理中（重复开工/已完成返回 409）。
+  - `POST /api/work-orders/:id/complete`：进入已完成，必须提交处置证据 `evidence`（跳过开工、重复完成返回 409）。
+- `POST /api/anomalies/:id/resolve`：异常存在关联工单时，必须所有关联工单均为 `completed` 且已提交处置证据，否则 409 阻止关闭；无关联工单时保留直接关闭的旧行为。
+- 保留旧行为：`POST /api/work-orders` 独立建工单（`anomalyId:null`，不阻塞任何异常）、调查证据继续通过 `/api/investigations/:id/evidence` 追加。
+- 查询：`GET /api/work-orders`（可按 status/assetId/anomalyId 过滤）、`GET /api/anomalies/:id/work-orders`。
+- 异常、调查、假设、工单不存在均返回 404；审计（`GET /api/audit`）记录关联四元组、`work-order.link`、每次状态变迁（from→to）、处置证据以及关闭拦截（`anomaly.resolve.blocked`），可完整还原关联与状态变化。

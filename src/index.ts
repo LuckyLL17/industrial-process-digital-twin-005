@@ -3,7 +3,12 @@ import { randomUUID } from 'node:crypto';
 
 type Telemetry = { time:string; assetId:string; values:Record<string,number>; quality:'good'|'suspect'|'bad' };
 type Asset = { id:string; name:string; type:string; parentId?:string; limits:Record<string,{min:number;max:number}>; state:'running'|'degraded'|'stopped'; last:Record<string,number> };
-type Anomaly = { id:string; time:string; assetId:string; variable:string; value:number; score:number; severity:'low'|'medium'|'high'; status:'open'|'investigating'|'resolved'; causes:string[] };
+type Anomaly = { id:string; time:string; assetId:string; variable:string; value:number; score:number; severity:'low'|'medium'|'high'; status:'open'|'investigating'|'resolved'; causes:string[]; resolvedAt?:string };
+type WorkOrderStatus='planned'|'in_progress'|'completed';
+type DisposalEvidence={id:string;observation:string;time:string};
+type Hypothesis={id:string;cause:string;prior:number;posterior?:number;evidence:{id:string;observation:string;likelihood:number;time:string}[];status:'open'|'converted';workOrderId?:string|null;convertedAt?:string};
+type Investigation={id:string;anomalyId:string;createdAt:string;hypotheses:Hypothesis[];tests:any[];status:string};
+type WorkOrder={id:string;assetId:string;reason:string;priority:string;status:WorkOrderStatus;createdAt:string;startedAt?:string;completedAt?:string;completedBy?:string;requiredSkills:string[];lockoutRequired:boolean;anomalyId?:string|null;investigationId?:string|null;hypothesisId?:string|null;completionEvidence:DisposalEvidence[]};
 const app=Fastify({logger:true});
 const now=()=>new Date().toISOString();
 const assets:Asset[]=[
@@ -11,7 +16,7 @@ const assets:Asset[]=[
  {id:'pump-01',name:'进料泵 P-01',type:'pump',parentId:'reactor-01',limits:{pressure:{min:1.8,max:3.6},flow:{min:90,max:125},vibration:{min:0,max:3}},state:'running',last:{pressure:2.8,flow:108,vibration:1.2}},
  {id:'heater-01',name:'预热器 H-01',type:'heater',parentId:'reactor-01',limits:{temperature:{min:120,max:180},power:{min:20,max:90}},state:'running',last:{temperature:145,power:54}}
 ];
-const telemetry:Telemetry[]=[]; const anomalies:Anomaly[]=[]; const investigations:any[]=[]; const scenarios:any[]=[]; const workOrders:any[]=[]; const audit:any[]=[];
+const telemetry:Telemetry[]=[]; const anomalies:Anomaly[]=[]; const investigations:Investigation[]=[]; const scenarios:any[]=[]; const workOrders:WorkOrder[]=[]; const audit:any[]=[];
 const causalEdges=[
  {from:'pump-01',to:'reactor-01',relation:'feeds'}, {from:'heater-01',to:'reactor-01',relation:'conditions'},
  {from:'low-flow',to:'temperature-drift',relation:'causes',weight:.71}, {from:'high-vibration',to:'low-flow',relation:'causes',weight:.64},
@@ -25,13 +30,64 @@ app.get('/api/twin/state',async()=>({at:now(),assets,openAnomalies:anomalies.fil
 app.post('/api/telemetry/ingest',async(req:any,res)=>{const body=req.body as Partial<Telemetry>; if(!body.assetId||!body.values) return res.code(400).send({error:'assetId 和 values 必填'}); const item:Telemetry={time:body.time||now(),assetId:body.assetId,values:body.values,quality:body.quality||'good'}; telemetry.push(item); const asset=assets.find(a=>a.id===item.assetId); if(!asset) return res.code(404).send({error:'asset not found'}); asset.last={...asset.last,...item.values}; detect(item); log('telemetry.ingest',item.assetId,item); return {accepted:true,anomalies:anomalies.filter(a=>a.time===item.time&&a.assetId===item.assetId)};});
 app.get('/api/telemetry/replay',async(req:any)=>{const q=req.query as any; const from=Number(q.from||0), to=Number(q.to||Date.now()); return {items:telemetry.filter(t=>{const x=Date.parse(t.time);return x>=from&&x<=to}),cursor:{from,to,next:to+1}};});
 app.get('/api/anomalies',async(req:any)=>{const q=req.query as any; return anomalies.filter(a=>(!q.status||a.status===q.status)&&(!q.severity||a.severity===q.severity));});
-app.post('/api/anomalies/:id/investigate',async(req:any,res)=>{const a=anomalies.find(x=>x.id===(req.params as any).id); if(!a)return res.code(404).send({error:'anomaly not found'}); a.status='investigating'; const inv={id:randomUUID(),anomalyId:a.id,createdAt:now(),hypotheses:a.causes.map((cause,i)=>({id:randomUUID(),cause,prior:.6-i*.12,evidence:[],status:'open'})),tests:[],status:'open'}; investigations.push(inv); log('investigation.create',inv.id,inv); return inv;});
+app.post('/api/anomalies/:id/investigate',async(req:any,res)=>{const a=anomalies.find(x=>x.id===(req.params as any).id); if(!a)return res.code(404).send({error:'anomaly not found'}); a.status='investigating'; const inv:Investigation={id:randomUUID(),anomalyId:a.id,createdAt:now(),hypotheses:a.causes.map((cause,i)=>({id:randomUUID(),cause,prior:.6-i*.12,evidence:[],status:'open' as const,workOrderId:null})),tests:[],status:'open'}; investigations.push(inv); log('investigation.create',inv.id,{anomalyId:inv.anomalyId,hypothesisIds:inv.hypotheses.map(h=>h.id)}); return inv;});
 app.post('/api/investigations/:id/evidence',async(req:any,res)=>{const inv=investigations.find(x=>x.id===(req.params as any).id); if(!inv)return res.code(404).send({error:'investigation not found'}); const b=req.body as any; if(!b.hypothesisId||!b.observation)return res.code(400).send({error:'hypothesisId 和 observation 必填'}); const h=inv.hypotheses.find((x:any)=>x.id===b.hypothesisId); if(!h)return res.code(404).send({error:'hypothesis not found'}); h.evidence.push({id:randomUUID(),observation:b.observation,likelihood:Number(b.likelihood??.5),time:now()}); h.posterior=Number((h.prior*Number(b.likelihood??.5)).toFixed(4)); if(b.supports===false) h.posterior=0; inv.hypotheses.sort((x:any,y:any)=>(y.posterior??y.prior)-(x.posterior??x.prior)); log('investigation.evidence',inv.id,b); return inv;});
 app.post('/api/scenarios',async(req:any,res)=>{const b=req.body as any; if(!b.name||!b.overrides)return res.code(400).send({error:'name 和 overrides 必填'}); const s={id:randomUUID(),name:b.name,baseAt:now(),overrides:b.overrides,status:'draft',result:null}; scenarios.push(s); return s;});
 app.post('/api/scenarios/:id/run',async(req:any,res)=>{const s=scenarios.find(x=>x.id===(req.params as any).id); if(!s)return res.code(404).send({error:'scenario not found'}); const ov=s.overrides as Record<string,number>; const flow=Number(ov.flow??108), temp=Number(ov.temperature??75), pressure=Number(ov.pressure??2.7), vibration=Number(ov.vibration??1.2); const quality=Math.max(0,Math.min(100,99.4-Math.abs(flow-108)*.08-Math.abs(temp-75)*.11-Math.max(0,vibration-1.5)*2)); s.status='simulated'; s.result={throughput:flow*.996,quality:Number(quality.toFixed(2)),energy:Number((54+Math.abs(temp-75)*.5+pressure*1.2).toFixed(2)),risk:{thermal:temp>82?.82:.12,hydraulic:flow<90?.9:.18,mechanical:vibration>3?.88:.1},constraintViolations:[...(temp<68||temp>82?['reactor.temperature']:[]),...(flow<90||flow>120?['reactor.flow']:[])]}; log('scenario.run',s.id,s.result); return s;});
 app.get('/api/causal-graph/:id',async(req:any)=>({rootId:(req.params as any).id,nodes:[...new Set(causalEdges.flatMap(e=>[e.from,e.to]))].map(id=>({id,label:id})),edges:causalEdges}));
-app.post('/api/work-orders',async(req:any,res)=>{const b=req.body as any; if(!b.assetId||!b.reason)return res.code(400).send({error:'assetId 和 reason 必填'}); const w={id:randomUUID(),assetId:b.assetId,reason:b.reason,priority:b.priority||'medium',status:'planned',createdAt:now(),requiredSkills:b.requiredSkills||[],lockoutRequired:Boolean(b.lockoutRequired)}; workOrders.push(w); log('work-order.create',w.id,w); return w;});
-app.post('/api/anomalies/:id/resolve',async(req:any,res)=>{const a=anomalies.find(x=>x.id===(req.params as any).id);if(!a)return res.code(404).send({error:'anomaly not found'}); const b=req.body as any;if(!b.evidence)return res.code(400).send({error:'resolution evidence required'});a.status='resolved';log('anomaly.resolve',a.id,b);return a;});
+app.post('/api/work-orders',async(req:any,res)=>{const b=req.body as any; if(!b.assetId||!b.reason)return res.code(400).send({error:'assetId 和 reason 必填'}); const w:WorkOrder={id:randomUUID(),assetId:b.assetId,reason:b.reason,priority:b.priority||'medium',status:'planned',createdAt:now(),requiredSkills:b.requiredSkills||[],lockoutRequired:Boolean(b.lockoutRequired),anomalyId:null,investigationId:null,hypothesisId:null,completionEvidence:[]}; workOrders.push(w); log('work-order.create',w.id,{workOrderId:w.id,assetId:w.assetId,status:w.status,link:null}); return w;});
+app.post('/api/investigations/:id/hypotheses/:hid/convert',async(req:any,res)=>{
+  const inv=investigations.find(x=>x.id===(req.params as any).id);
+  if(!inv)return res.code(404).send({error:'investigation not found'});
+  const b=req.body as any; const h=inv.hypotheses.find(x=>x.id===(req.params as any).hid);
+  if(!h)return res.code(404).send({error:'hypothesis not found'});
+  // 幂等：同一假设重复转换直接返回原工单，不再派单
+  if(h.status==='converted'&&h.workOrderId){
+    const existing=workOrders.find(w=>w.id===h.workOrderId);
+    if(existing){ log('work-order.convert.dedup',h.workOrderId,{investigationId:inv.id,hypothesisId:h.id,anomalyId:inv.anomalyId}); return {deduplicated:true,workOrder:existing}; }
+  }
+  const a=anomalies.find(x=>x.id===inv.anomalyId);
+  if(!a)return res.code(404).send({error:'anomaly not found'});
+  const w:WorkOrder={id:randomUUID(),assetId:a.assetId,reason:b.reason||`处置假设：${h.cause}`,priority:b.priority||a.severity,status:'planned',createdAt:now(),requiredSkills:b.requiredSkills||[],lockoutRequired:Boolean(b.lockoutRequired),anomalyId:a.id,investigationId:inv.id,hypothesisId:h.id,completionEvidence:[]};
+  workOrders.push(w); h.status='converted'; h.workOrderId=w.id; h.convertedAt=now();
+  const link={anomalyId:a.id,investigationId:inv.id,hypothesisId:h.id,workOrderId:w.id};
+  log('work-order.create',w.id,{workOrderId:w.id,assetId:w.assetId,status:w.status,link});
+  log('work-order.link',w.id,link);
+  return {deduplicated:false,workOrder:w,link};
+});
+app.post('/api/work-orders/:id/start',async(req:any,res)=>{
+  const w=workOrders.find(x=>x.id===(req.params as any).id);
+  if(!w)return res.code(404).send({error:'work order not found'});
+  if(w.status==='completed')return res.code(409).send({error:'work order already completed',status:w.status});
+  if(w.status==='in_progress')return res.code(409).send({error:'work order already in progress',status:w.status});
+  const from=w.status; w.status='in_progress'; w.startedAt=now();
+  log('work-order.status-change',w.id,{workOrderId:w.id,from,to:w.status,time:w.startedAt,link:{anomalyId:w.anomalyId??null,investigationId:w.investigationId??null,hypothesisId:w.hypothesisId??null}});
+  return w;
+});
+app.post('/api/work-orders/:id/complete',async(req:any,res)=>{
+  const w=workOrders.find(x=>x.id===(req.params as any).id);
+  if(!w)return res.code(404).send({error:'work order not found'});
+  const b=req.body as any;
+  if(!b.evidence)return res.code(400).send({error:'disposal evidence required'});
+  if(w.status==='completed')return res.code(409).send({error:'work order already completed',status:w.status});
+  if(w.status!=='in_progress')return res.code(409).send({error:'work order must be in_progress before completion',status:w.status});
+  const ev:DisposalEvidence={id:randomUUID(),observation:String(b.evidence),time:now()};
+  w.completionEvidence.push(ev); w.status='completed'; w.completedAt=now(); w.completedBy=b.completedBy||'maintenance';
+  log('work-order.complete',w.id,{workOrderId:w.id,from:'in_progress',to:'completed',evidence:ev,completedBy:w.completedBy,link:{anomalyId:w.anomalyId??null,investigationId:w.investigationId??null,hypothesisId:w.hypothesisId??null}});
+  return w;
+});
+app.get('/api/work-orders',async(req:any)=>{const q=req.query as any; return workOrders.filter(w=>(!q.status||w.status===q.status)&&(!q.assetId||w.assetId===q.assetId)&&(!q.anomalyId||w.anomalyId===q.anomalyId));});
+app.get('/api/anomalies/:id/work-orders',async(req:any,res)=>{const a=anomalies.find(x=>x.id===(req.params as any).id); if(!a)return res.code(404).send({error:'anomaly not found'}); return workOrders.filter(w=>w.anomalyId===a.id);});
+app.post('/api/anomalies/:id/resolve',async(req:any,res)=>{const a=anomalies.find(x=>x.id===(req.params as any).id);if(!a)return res.code(404).send({error:'anomaly not found'}); const b=req.body as any;if(!b.evidence)return res.code(400).send({error:'resolution evidence required'});
+ // 门禁：异常存在关联工单时，必须全部完成且提交处置证据；独立（无关联）工单不影响关闭
+ const linked=workOrders.filter(w=>w.anomalyId===a.id);
+ const pending=linked.filter(w=>w.status!=='completed');
+ const missingEvidence=linked.filter(w=>w.status==='completed'&&w.completionEvidence.length===0);
+ if(pending.length||missingEvidence.length){
+  log('anomaly.resolve.blocked',a.id,{anomalyId:a.id,pendingWorkOrderIds:pending.map(w=>({id:w.id,status:w.status})),missingEvidenceWorkOrderIds:missingEvidence.map(w=>w.id)});
+  return res.code(409).send({error:'linked work orders must be completed with disposal evidence',pending:pending.map(w=>({id:w.id,status:w.status})),missingEvidence:missingEvidence.map(w=>w.id)});
+ }
+ a.status='resolved';a.resolvedAt=now();log('anomaly.resolve',a.id,{anomalyId:a.id,evidence:b.evidence,linkedWorkOrderIds:linked.map(w=>w.id),linkedCompleted:linked.length,resolvedAt:a.resolvedAt});return a;});
 app.get('/api/audit',async()=>audit.slice(-100));
 
 // Advanced operations: recipe governance, closed-loop control, maintenance windows and safety gates.
